@@ -2,7 +2,7 @@ const path = require("path");
 const fs = require("fs");
 const express = require("express");
 const session = require("express-session");
-const sqlite3 = require("sqlite3").verbose();
+const Database = require("better-sqlite3");
 
 const app = express();
 
@@ -20,6 +20,32 @@ app.use(
   })
 );
 
+// ── Database setup (better-sqlite3 is synchronous) ──────────────────────────
+const db = new Database(DB_PATH);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    password TEXT NOT NULL,
+    created_at_utc INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS sensor_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    temperature REAL NOT NULL,
+    humidity REAL NOT NULL,
+    timestamp_utc INTEGER NOT NULL
+  );
+`);
+
+// Demo admin user (ignored if already exists)
+db.prepare(
+  `INSERT OR IGNORE INTO users (name, email, password, created_at_utc) VALUES (?, ?, ?, ?)`
+).run("SISTec Admin", "admin@sistec.com", "1234", Date.now());
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
 function ensureLcdFile() {
   try {
     if (!fs.existsSync(LCD_PATH)) fs.writeFileSync(LCD_PATH, "WELCOME SISTEC\n", "utf8");
@@ -48,35 +74,6 @@ function toISTParts(date) {
   return { dateStr, timeStr };
 }
 
-const db = new sqlite3.Database(DB_PATH);
-db.serialize(() => {
-  db.run(
-    `CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      email TEXT NOT NULL UNIQUE,
-      password TEXT NOT NULL,
-      created_at_utc INTEGER NOT NULL
-    )`
-  );
-
-  db.run(
-    `CREATE TABLE IF NOT EXISTS sensor_records (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      temperature REAL NOT NULL,
-      humidity REAL NOT NULL,
-      timestamp_utc INTEGER NOT NULL
-    )`
-  );
-
-  // Demo user for quick login (created only if missing)
-  db.run(
-    `INSERT OR IGNORE INTO users (name, email, password, created_at_utc)
-     VALUES (?, ?, ?, ?)`,
-    ["SISTec Admin", "admin@sistec.com", "1234", Date.now()]
-  );
-});
-
 function requireAuth(req, res, next) {
   if (!req.session || !req.session.user) return res.redirect("/");
   next();
@@ -103,6 +100,7 @@ function renderTemplate(html, vars) {
   return out;
 }
 
+// ── Routes ───────────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   if (req.session?.user) return res.redirect("/dashboard");
   res.type("html").send(readHtml("index.html"));
@@ -120,14 +118,14 @@ app.post("/register", (req, res) => {
 
   if (!name || !email || !password) return res.status(400).send("All fields are required.");
 
-  db.run(
-    `INSERT INTO users (name, email, password, created_at_utc) VALUES (?, ?, ?, ?)`,
-    [name, email, password, Date.now()],
-    (err) => {
-      if (err) return res.status(400).send("User already exists or invalid data.");
-      res.redirect("/");
-    }
-  );
+  try {
+    db.prepare(
+      `INSERT INTO users (name, email, password, created_at_utc) VALUES (?, ?, ?, ?)`
+    ).run(name, email, password, Date.now());
+    res.redirect("/");
+  } catch (err) {
+    res.status(400).send("User already exists or invalid data.");
+  }
 });
 
 app.post("/login", (req, res) => {
@@ -136,12 +134,13 @@ app.post("/login", (req, res) => {
 
   if (!email || !password) return res.status(400).send("Email and password are required.");
 
-  db.get(`SELECT id, name, email FROM users WHERE email = ? AND password = ?`, [email, password], (err, row) => {
-    if (err) return res.status(500).send("Server error.");
-    if (!row) return res.status(401).send("Invalid email or password.");
-    req.session.user = row;
-    res.redirect("/dashboard");
-  });
+  const row = db
+    .prepare(`SELECT id, name, email FROM users WHERE email = ? AND password = ?`)
+    .get(email, password);
+
+  if (!row) return res.status(401).send("Invalid email or password.");
+  req.session.user = row;
+  res.redirect("/dashboard");
 });
 
 app.post("/logout", (req, res) => {
@@ -150,53 +149,52 @@ app.post("/logout", (req, res) => {
 
 app.get("/dashboard", requireAuth, (req, res) => {
   const user = req.session.user;
+  const rows = db
+    .prepare(`SELECT id, temperature, humidity, timestamp_utc FROM sensor_records ORDER BY id DESC`)
+    .all();
 
-  db.all(`SELECT id, temperature, humidity, timestamp_utc FROM sensor_records ORDER BY id DESC`, (err, rows) => {
-    if (err) return res.status(500).send("DB error.");
+  const latest = rows[0] || null;
+  const latestTemp = latest ? latest.temperature : "--";
+  const latestHum = latest ? latest.humidity : "--";
+  const latestTime = latest ? toISTParts(latest.timestamp_utc).timeStr : "--";
+  const latestDate = latest ? toISTParts(latest.timestamp_utc).dateStr : "--";
 
-    const latest = rows[0] || null;
-    const latestTemp = latest ? latest.temperature : "--";
-    const latestHum = latest ? latest.humidity : "--";
-    const latestTime = latest ? toISTParts(latest.timestamp_utc).timeStr : "--";
-    const latestDate = latest ? toISTParts(latest.timestamp_utc).dateStr : "--";
+  const tableRows = rows
+    .map((r, idx) => {
+      const { dateStr, timeStr } = toISTParts(r.timestamp_utc);
+      return `
+        <tr class="border-b">
+          <td class="p-2">${rows.length - idx}</td>
+          <td class="p-2">${escapeHtml(r.temperature)}</td>
+          <td class="p-2">${escapeHtml(r.humidity)}</td>
+          <td class="p-2">${escapeHtml(timeStr)}</td>
+          <td class="p-2">${escapeHtml(dateStr)}</td>
+          <td class="p-2">
+            <form method="POST" action="/records/delete" onsubmit="return confirm('Delete this record?');">
+              <input type="hidden" name="id" value="${escapeHtml(r.id)}" />
+              <button class="bg-red-600 text-white px-3 py-1 rounded" type="submit">Delete</button>
+            </form>
+          </td>
+        </tr>
+      `.trim();
+    })
+    .join("\n");
 
-    const tableRows = rows
-      .map((r, idx) => {
-        const { dateStr, timeStr } = toISTParts(r.timestamp_utc);
-        return `
-          <tr class="border-b">
-            <td class="p-2">${rows.length - idx}</td>
-            <td class="p-2">${escapeHtml(r.temperature)}</td>
-            <td class="p-2">${escapeHtml(r.humidity)}</td>
-            <td class="p-2">${escapeHtml(timeStr)}</td>
-            <td class="p-2">${escapeHtml(dateStr)}</td>
-            <td class="p-2">
-              <form method="POST" action="/records/delete" onsubmit="return confirm('Delete this record?');">
-                <input type="hidden" name="id" value="${escapeHtml(r.id)}" />
-                <button class="bg-red-600 text-white px-3 py-1 rounded" type="submit">Delete</button>
-              </form>
-            </td>
-          </tr>
-        `.trim();
-      })
-      .join("\n");
+  ensureLcdFile();
+  const lcdText = fs.readFileSync(LCD_PATH, "utf8").trim().slice(0, 16);
 
-    ensureLcdFile();
-    const lcdText = fs.readFileSync(LCD_PATH, "utf8").trim().slice(0, 16);
-
-    const html = readHtml("dashboard.html");
-    res.type("html").send(
-      renderTemplate(html, {
-        username: escapeHtml(user.name),
-        latestTemperature: escapeHtml(latestTemp),
-        latestHumidity: escapeHtml(latestHum),
-        latestTime: escapeHtml(latestTime),
-        latestDate: escapeHtml(latestDate),
-        lcdCurrentText: escapeHtml(lcdText),
-        recordsRows: tableRows || `<tr><td class="p-2" colspan="6">No records yet.</td></tr>`,
-      })
-    );
-  });
+  const html = readHtml("dashboard.html");
+  res.type("html").send(
+    renderTemplate(html, {
+      username: escapeHtml(user.name),
+      latestTemperature: escapeHtml(latestTemp),
+      latestHumidity: escapeHtml(latestHum),
+      latestTime: escapeHtml(latestTime),
+      latestDate: escapeHtml(latestDate),
+      lcdCurrentText: escapeHtml(lcdText),
+      recordsRows: tableRows || `<tr><td class="p-2" colspan="6">No records yet.</td></tr>`,
+    })
+  );
 });
 
 app.post("/lcd", requireAuth, (req, res) => {
@@ -209,46 +207,40 @@ app.post("/lcd", requireAuth, (req, res) => {
 app.post("/records/delete", requireAuth, (req, res) => {
   const id = Number(req.body.id);
   if (!Number.isFinite(id)) return res.status(400).send("Invalid id.");
-  db.run(`DELETE FROM sensor_records WHERE id = ?`, [id], () => res.redirect("/dashboard"));
+  db.prepare(`DELETE FROM sensor_records WHERE id = ?`).run(id);
+  res.redirect("/dashboard");
 });
 
-// Latest reading + current IST time + full records (for Refresh button)
+// ── API Endpoints (for ESP8266 + Refresh button) ─────────────────────────────
 app.get("/api/sensors/latest", (req, res) => {
-  db.all(`SELECT id, temperature, humidity, timestamp_utc FROM sensor_records ORDER BY id DESC`, (err, rows) => {
-    if (err) return res.status(500).json({ ok: false, error: "db error" });
+  const rows = db
+    .prepare(`SELECT id, temperature, humidity, timestamp_utc FROM sensor_records ORDER BY id DESC`)
+    .all();
 
-    const now = Date.now();
-    const nowIST = toISTParts(now);
+  const now = Date.now();
+  const nowIST = toISTParts(now);
+  const latestRow = rows[0] || null;
 
-    const latestRow = rows[0] || null;
-    const records = rows.map((r) => {
-      const { dateStr, timeStr } = toISTParts(r.timestamp_utc);
-      return {
-        id: r.id,
-        temperature: r.temperature,
-        humidity: r.humidity,
-        time: timeStr,
-        date: dateStr,
-      };
-    });
+  const records = rows.map((r) => {
+    const { dateStr, timeStr } = toISTParts(r.timestamp_utc);
+    return { id: r.id, temperature: r.temperature, humidity: r.humidity, time: timeStr, date: dateStr };
+  });
 
-    return res.json({
-      ok: true,
-      latest: latestRow
-        ? {
-            id: latestRow.id,
-            temperature: latestRow.temperature,
-            humidity: latestRow.humidity,
-            timestamp_utc: latestRow.timestamp_utc,
-          }
-        : null,
-      now: { timestamp_utc: now, time: nowIST.timeStr, date: nowIST.dateStr },
-      records,
-    });
+  return res.json({
+    ok: true,
+    latest: latestRow
+      ? {
+          id: latestRow.id,
+          temperature: latestRow.temperature,
+          humidity: latestRow.humidity,
+          timestamp_utc: latestRow.timestamp_utc,
+        }
+      : null,
+    now: { timestamp_utc: now, time: nowIST.timeStr, date: nowIST.dateStr },
+    records,
   });
 });
 
-// API 1: ESP8266 sends temperature, humidity, timestamp
 app.all("/api/sensors/save", (req, res) => {
   const src = req.method === "GET" ? req.query : req.body;
   const temperature = Number(src.temperature);
@@ -260,17 +252,16 @@ app.all("/api/sensors/save", (req, res) => {
   }
 
   const ts = Number.isFinite(timestamp) ? timestamp : Date.now();
-  db.run(
-    `INSERT INTO sensor_records (temperature, humidity, timestamp_utc) VALUES (?, ?, ?)`,
-    [temperature, humidity, ts],
-    (err) => {
-      if (err) return res.status(500).json({ ok: false, error: "db error" });
-      res.json({ ok: true });
-    }
-  );
+  try {
+    db.prepare(
+      `INSERT INTO sensor_records (temperature, humidity, timestamp_utc) VALUES (?, ?, ?)`
+    ).run(temperature, humidity, ts);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: "db error" });
+  }
 });
 
-// API 2: ESP8266 fetches LCD text (max 16 chars)
 app.get("/api/lcd/fetch", (req, res) => {
   ensureLcdFile();
   let text = "";
@@ -288,4 +279,3 @@ app.listen(PORT, () => {
   ensureLcdFile();
   console.log(`Server running on port ${PORT}`);
 });
-

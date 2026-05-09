@@ -4,14 +4,15 @@
   "description": "Beginner IoT dashboard (ESP8266 + DHT11 + LCD) with Node/Express + SQLite.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "build": "npm install"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
+    "better-sqlite3": "^9.6.0",
     "express": "^5.1.0",
-    "express-session": "^1.18.2",
-    "sqlite3": "^5.1.7"
+    "express-session": "^1.18.2"
   }
 }
